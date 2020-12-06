@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2020, shimamu."
 #property link      "https://github.com/shimamu"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 #include <stdlib.mqh>
@@ -17,6 +17,8 @@ extern double Lots = 0.04; // 1 Lot = 100,000 currency.
 int MagicNumber = 20201116;
 double GridSpace = 0.25;
 int Slippage = 3;
+int MiliSecondsAfterRequest = 1000;
+int MiliSecondsAfterError = 1000;
 double BuyMaxPrice = 109.95;
 double BuyMinPrice = 100.2;
 double SellMaxPrice = 114.95;
@@ -26,6 +28,36 @@ struct Order {
     int ticket;  // Order number.
     double lots;
     double price;
+};
+
+class Price {
+private:
+    double value;
+
+public:
+    void Price(double price) {
+        this.value = price;
+    }
+
+    bool isLargerThan(double price) {
+        return (price < this.value);
+    }
+
+    bool isLessThan(double price) {
+        return (this.value < price);
+    }
+
+    bool isOrLargerThan(double price) {
+        return (price <= this.value);
+    }
+
+    bool isOrLessThan(double price) {
+        return (this.value <= price);
+    }
+
+    double toDouble() {
+        return this.value;
+    }
 };
 
 //+------------------------------------------------------------------+
@@ -43,13 +75,85 @@ protected:
     double lots_total;
     double next_entry_price;
     double next_exit_price;
-    virtual double countEntryLots() = 0;
-    virtual double exitRate() = 0;
-    virtual double entryRate() = 0;
-    virtual bool hasExitSign() = 0;
-    virtual bool hasEntrySign() = 0;
-    virtual void setNextTargetAfterExit() = 0;
+    virtual double countEntryLots(Price* entryRate) = 0;
+    virtual Price* createEntryRate() = 0;
+    virtual Price* createExitRate() = 0;
+    virtual bool hasEntrySign(Price* entryRate) = 0;
+    virtual bool hasExitSign(Price* exitRate) = 0;
+    virtual bool isSkipEntry(Price* entryRate) = 0;
+    virtual double lastEntryPrice() = 0;
     virtual void setNextTargetAfterEntry() = 0;
+    virtual void setNextTargetAfterExit() = 0;
+
+    void checkError(string msg) {
+        int error_code = GetLastError();
+        if (error_code != ERR_NO_ERROR) {
+            printf(
+                "Error in (%s)  code:%d,  detail:%s ",
+                msg,
+                error_code,
+                ErrorDescription(error_code));
+        }
+    }
+
+    void checkForEntry(Price* entryRate) {
+        if (!this.hasEntrySign(entryRate)) {
+            if (this.isSkipEntry(entryRate)) {
+                this.setNextTargetAfterEntry();
+            }
+            return;
+        }
+
+        double entry_lots = this.countEntryLots(entryRate);
+        if (entry_lots <= 0) {
+            this.setNextTargetAfterEntry();
+            return;
+        }
+
+        int ticket = OrderSend(
+                         Symbol(),
+                         this.OrderType,
+                         entry_lots,
+                         entryRate.toDouble(),
+                         Slippage,
+                         0,
+                         0,
+                         NULL,
+                         MagicNumber,
+                         0,
+                         this.EntryColor);
+        if (ticket > 0) {
+            this.setNextTargetAfterEntry();
+            Sleep(MiliSecondsAfterRequest);
+        } else {
+            this.checkError("OrderSend");
+            Sleep(MiliSecondsAfterError);
+        }
+    }
+
+    void checkForExit(Price* exitRate) {
+        if (!this.hasOrder()) {
+            return;
+        }
+
+        if (!this.hasExitSign(exitRate)) {
+            return;
+        }
+
+        bool success = OrderClose(
+                           this.last_order.ticket,
+                           Lots,
+                           exitRate.toDouble(),
+                           Slippage,
+                           this.ExitColor);
+        if (success) {
+            this.setNextTargetAfterExit();
+            Sleep(MiliSecondsAfterRequest);
+        } else {
+            this.checkError("OrderClose");
+            Sleep(MiliSecondsAfterError);
+        }
+    }
 
     void checkOrder() {
         Order last_order = {};
@@ -80,6 +184,33 @@ protected:
         this.lots_total = lots_total;
     }
 
+    double countEntryLots(Price* entryRate, double price_a, double price_b) {
+        if (!this.entryRateIsBetweenMinAndMaxPrice(entryRate)) {
+            return 0;
+        }
+        int max_grid_num = this.countGrid(price_a, price_b);
+        double max_lots = max_grid_num * Lots;
+        double need_lots = max_lots - this.lots_total;
+        return need_lots;
+    }
+
+    int countGrid(double price_a, double price_b) {
+        return int(MathAbs(price_a - price_b) / GridSpace) + 1;
+    }
+
+    bool entryRateIsBetweenMinAndMaxPrice(Price* entryRate) {
+        return (entryRate.isOrLargerThan(this.MinPrice)
+                && entryRate.isOrLessThan(this.MaxPrice));
+    }
+
+    bool hasLotsForNextEntryPrice(Price* entryRate) {
+        return (this.countEntryLots(entryRate) <= -Lots);
+    }
+
+    bool hasOneLots() {
+        return (this.lots_total == Lots);
+    }
+
     bool hasOrder() {
         if (this.last_order.ticket > 0) {
             return true;
@@ -87,74 +218,21 @@ protected:
         return false;
     }
 
-    void checkForExit() {
-        if (!this.hasOrder()) {
-            return;
-        }
-
-        if (!this.hasExitSign()) {
-            return;
-        }
-
-        bool success = OrderClose(
-                           this.last_order.ticket,
-                           Lots,
-                           this.exitRate(),
-                           Slippage,
-                           this.ExitColor);
-        if (success) {
-            this.setNextTargetAfterExit();
-        } else {
-            this.checkError("OrderClose");
-            Sleep(1000);
-        }
-    }
-
-    void checkForEntry() {
-        if (!this.hasEntrySign()) {
-            return;
-        }
-
-        double entry_lots = this.countEntryLots();
-        if (entry_lots <= 0) {
-            this.setNextTargetAfterEntry();
-            return;
-        }
-
-        int ticket = OrderSend(
-                         Symbol(),
-                         this.OrderType,
-                         entry_lots,
-                         this.entryRate(),
-                         Slippage,
-                         0,
-                         0,
-                         NULL,
-                         MagicNumber,
-                         0,
-                         this.EntryColor);
-        if (ticket > 0) {
-            this.setNextTargetAfterEntry();
-        } else {
-            this.checkError("OrderSend");
-            Sleep(1000);
-        }
-    }
-
-    void checkError(string msg) {
-        int error_code = GetLastError();
-        if (error_code != ERR_NO_ERROR) {
-            printf(
-                "Error in (%s)  code:%d,  detail:%s ",
-                msg,
-                error_code,
-                ErrorDescription(error_code));
-        }
-    }
-
     void moveNextTarget(double points) {
         this.next_entry_price += points;
         this.next_exit_price += points;
+        this.printNextTarget();
+    }
+
+    void moveNextTargetDown() {
+        this.moveNextTarget(- GridSpace);
+    }
+
+    void moveNextTargetUp() {
+        this.moveNextTarget(GridSpace);
+    }
+
+    void printNextTarget() {
         printf(
             "-> next %s  entry:%.3f  exit:%.3f",
             this.OrderTypeLabel,
@@ -162,19 +240,13 @@ protected:
             this.next_exit_price);
     }
 
-    void moveNextTargetUp() {
-        this.moveNextTarget(GridSpace);
-    }
-
-    void moveNextTargetDown() {
-        this.moveNextTarget(- GridSpace);
-    }
-
 public:
     void run() {
+        Price* entryRate = this.createEntryRate();
+        Price* exitRate = this.createExitRate();
         this.checkOrder();
-        this.checkForExit();
-        this.checkForEntry();
+        this.checkForExit(exitRate);
+        this.checkForEntry(entryRate);
     }
 };
 
@@ -182,58 +254,60 @@ public:
 //| Specifics of buy position.                                       |
 //+------------------------------------------------------------------+
 class BuyOrderRule: public OrderRule {
+private:
+    bool entryRateIsInAreaForNextEntry(Price* entryRate) {
+        return (entryRate.isLargerThan(this.next_entry_price)
+                && entryRate.isLessThan(this.lastEntryPrice()));
+    }
+
+    bool hasMaxPriceEntryLots(Price* entryRate) {
+        return (entryRate.isLargerThan(this.MaxPrice)
+                && this.entryRateIsInAreaForNextEntry(entryRate)
+                && this.hasOneLots());
+    }
+
+    bool hasNextEntryLots(Price* entryRate) {
+        return (this.entryRateIsInAreaForNextEntry(entryRate)
+                && this.hasLotsForNextEntryPrice(entryRate));
+    }
+
 protected:
-    virtual bool hasExitSign() {
-        if (Bid < this.next_exit_price) {
-            return false;
-        }
-
-        if (Bid <= this.last_order.price) {
-            this.setNextTargetAfterExit();
-            return false;
-        }
-        return true;
+    virtual double countEntryLots(Price* entryRate) {
+        return this.countEntryLots(entryRate, this.MaxPrice, entryRate.toDouble());
     }
 
-    virtual double exitRate() {
-        return Bid;
+    virtual Price* createEntryRate() {
+        return new Price(Ask);
     }
 
-    virtual void setNextTargetAfterExit() {
-        this.moveNextTargetUp();
+    virtual Price* createExitRate() {
+        return new Price(Bid);
     }
 
-    virtual double entryRate() {
-        return Ask;
+    virtual bool hasEntrySign(Price* entryRate) {
+        return (this.entryRateIsBetweenMinAndMaxPrice(entryRate)
+                && entryRate.isOrLessThan(this.next_entry_price));
     }
 
-    virtual bool hasEntrySign() {
-        if (this.MaxPrice < Ask) {
-            return false;
-        }
+    virtual bool hasExitSign(Price* exitRate) {
+        return exitRate.isOrLargerThan(this.next_exit_price);
+    }
 
-        if (Ask < this.MinPrice) {
-            return false;
-        }
+    virtual bool isSkipEntry(Price* entryRate) {
+        return (hasMaxPriceEntryLots(entryRate)
+                || hasNextEntryLots(entryRate));
+    }
 
-        if (this.next_entry_price < Ask) {
-            return false;
-        }
-        return true;
+    virtual double lastEntryPrice() {
+        return this.next_entry_price + GridSpace;
     }
 
     virtual void setNextTargetAfterEntry() {
         this.moveNextTargetDown();
     }
 
-    virtual double countEntryLots() {
-        if (this.MaxPrice < Ask) {
-            return 0;
-        }
-        int max_position_num = int((this.MaxPrice - Ask) / GridSpace) + 1;
-        double max_lots = max_position_num * Lots;
-        double need_lots = max_lots - this.lots_total;
-        return need_lots;
+    virtual void setNextTargetAfterExit() {
+        this.moveNextTargetUp();
     }
 
 public:
@@ -246,6 +320,7 @@ public:
         this.ExitColor = clrBlue;
         this.next_entry_price = this.MaxPrice;
         this.next_exit_price = this.MaxPrice + GridSpace * 2;
+        this.printNextTarget();
     }
 };
 
@@ -253,59 +328,60 @@ public:
 //| Specifics of sell position.                                      |
 //+------------------------------------------------------------------+
 class SellOrderRule: public OrderRule {
-protected:
-    virtual bool hasExitSign() {
-        if (this.next_exit_price < Ask) {
-            return false;
-        }
-
-        if (this.last_order.price <= Ask) {
-            this.setNextTargetAfterExit();
-            return false;
-        }
-
-        return true;
+private:
+    bool entryRateIsInAreaForNextEntry(Price* entryRate) {
+        return (entryRate.isLargerThan(this.lastEntryPrice())
+                && entryRate.isLessThan(this.next_entry_price));
     }
 
-    virtual double exitRate() {
-        return Ask;
+    bool hasMinPriceEntryLots(Price* entryRate) {
+        return (entryRate.isLessThan(this.MinPrice)
+                && this.entryRateIsInAreaForNextEntry(entryRate)
+                && this.hasOneLots());
+    }
+
+    bool hasNextEntryLots(Price* entryRate) {
+        return (this.entryRateIsInAreaForNextEntry(entryRate)
+                && this.hasLotsForNextEntryPrice(entryRate));
+    }
+
+protected:
+    virtual double countEntryLots(Price* entryRate) {
+        return this.countEntryLots(entryRate, entryRate.toDouble(), this.MinPrice);
+    }
+
+    virtual Price* createEntryRate() {
+        return new Price(Bid);
+    }
+
+    virtual Price* createExitRate() {
+        return new Price(Ask);
+    }
+
+    virtual bool hasEntrySign(Price* entryRate) {
+        return (this.entryRateIsBetweenMinAndMaxPrice(entryRate)
+                && entryRate.isOrLargerThan(this.next_entry_price));
+    }
+
+    virtual bool hasExitSign(Price* exitRate) {
+        return exitRate.isOrLessThan(this.next_exit_price);
+    }
+
+    virtual bool isSkipEntry(Price* entryRate) {
+        return (hasMinPriceEntryLots(entryRate)
+                || hasNextEntryLots(entryRate));
+    }
+
+    virtual double lastEntryPrice() {
+        return this.next_entry_price - GridSpace;
     }
 
     virtual void setNextTargetAfterExit() {
         this.moveNextTargetDown();
     }
 
-    virtual double entryRate() {
-        return Bid;
-    }
-
-    virtual bool hasEntrySign() {
-        if (Bid < this.MinPrice) {
-            return false;
-        }
-
-        if (this.MaxPrice < Bid) {
-            return false;
-        }
-
-        if (Bid < this.next_entry_price) {
-            return false;
-        }
-        return true;
-    }
-
     virtual void setNextTargetAfterEntry() {
         this.moveNextTargetUp();
-    }
-
-    virtual double countEntryLots() {
-        if (Bid < this.MinPrice) {
-            return 0;
-        }
-        int max_position_num = int((Bid - this.MinPrice) / GridSpace) + 1;
-        double max_lots = max_position_num * Lots;
-        double need_lots = max_lots - this.lots_total;
-        return need_lots;
     }
 
 public:
@@ -318,6 +394,7 @@ public:
         this.ExitColor = clrRed;
         this.next_entry_price = this.MinPrice;
         this.next_exit_price = this.MinPrice - GridSpace * 2;
+        this.printNextTarget();
     }
 };
 
@@ -339,7 +416,7 @@ int OnInit() {
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
 //---
-
+//
 }
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
