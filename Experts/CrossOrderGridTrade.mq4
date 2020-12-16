@@ -139,7 +139,7 @@ private:
 
 public:
     Target(double target_entry_rate, double profit) {
-        _lastOrderRate = target_entry_rate - _profit;
+        _lastOrderRate = target_entry_rate + profit;
         _profit = profit;
     }
 
